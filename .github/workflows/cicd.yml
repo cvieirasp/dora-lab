@@ -1,0 +1,117 @@
+name: cicd
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: 'Simular falha no deploy de producao'
+        type: boolean
+        default: false
+
+# Um run por vez: a automacao de change nao suporta execucao paralela.
+concurrency:
+  group: cicd-main
+  cancel-in-progress: false
+
+env:
+  APP_VERSION: 1.${{ github.run_number }}
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Run unit tests
+        continue-on-error: ${{ vars.ALLOW_TEST_FAILURES == 'true' }}
+        run: pytest --junitxml=test-results/results.xml
+
+      - name: ServiceNow DevOps Unit Test Results
+        if: always()
+        uses: ServiceNow/servicenow-devops-test-report@v6.0.0
+        with:
+          devops-integration-token: ${{ secrets.SN_DEVOPS_INTEGRATION_TOKEN }}
+          instance-url: ${{ secrets.SN_INSTANCE_URL }}
+          tool-id: ${{ secrets.SN_ORCHESTRATION_TOOL_ID }}
+          context-github: ${{ toJSON(github) }}
+          job-name: 'Build and Test'
+          xml-report-filename: test-results/results.xml
+          test-summary-name: 'Unit tests'
+
+      - name: Build package
+        run: tar -czf dora-lab-${{ env.APP_VERSION }}.tgz app
+
+      - name: ServiceNow Register Artifact
+        uses: ServiceNow/servicenow-devops-register-artifact@v3.1.0
+        with:
+          devops-integration-token: ${{ secrets.SN_DEVOPS_INTEGRATION_TOKEN }}
+          instance-url: ${{ secrets.SN_INSTANCE_URL }}
+          tool-id: ${{ secrets.SN_ORCHESTRATION_TOOL_ID }}
+          context-github: ${{ toJSON(github) }}
+          job-name: 'Build and Test'
+          artifacts: '[{"name": "dora-lab", "version": "${{ env.APP_VERSION }}", "semanticVersion": "${{ env.APP_VERSION }}.0", "repositoryName": "${{ github.repository }}"}]'
+
+      - name: ServiceNow Register Package
+        uses: ServiceNow/servicenow-devops-register-package@v3.1.0
+        with:
+          devops-integration-token: ${{ secrets.SN_DEVOPS_INTEGRATION_TOKEN }}
+          instance-url: ${{ secrets.SN_INSTANCE_URL }}
+          tool-id: ${{ secrets.SN_ORCHESTRATION_TOOL_ID }}
+          context-github: ${{ toJSON(github) }}
+          job-name: 'Build and Test'
+          artifacts: '[{"name": "dora-lab", "version": "${{ env.APP_VERSION }}", "semanticVersion": "${{ env.APP_VERSION }}.0", "repositoryName": "${{ github.repository }}"}]'
+          package-name: 'dora-lab-${{ env.APP_VERSION }}.tgz'
+
+  deploy-staging:
+    name: Deploy Staging
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to staging (simulado)
+        run: |
+          echo "Deploy da versao $APP_VERSION em staging"
+          sleep 10
+
+  deploy-prod:
+    name: Deploy Production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: ServiceNow Change
+        id: change
+        if: vars.SN_CHANGE_ENABLED == 'true'
+        uses: ServiceNow/servicenow-devops-change@v6.1.0
+        with:
+          devops-integration-token: ${{ secrets.SN_DEVOPS_INTEGRATION_TOKEN }}
+          instance-url: ${{ secrets.SN_INSTANCE_URL }}
+          tool-id: ${{ secrets.SN_ORCHESTRATION_TOOL_ID }}
+          context-github: ${{ toJSON(github) }}
+          job-name: 'Deploy Production'
+          change-request: '{"setCloseCode": "true", "autoCloseChange": true, "attributes": {"short_description": "Deploy dora-lab ${{ env.APP_VERSION }} em producao", "description": "Deploy automatizado pelo workflow cicd, run ${{ github.run_number }}, commit ${{ github.sha }}.", "assignment_group": "${{ vars.SN_ASSIGNMENT_GROUP }}", "implementation_plan": "O job Deploy Production publica o pacote registrado nesta execucao.", "backout_plan": "Reexecutar o workflow no commit anterior.", "test_plan": "Testes unitarios registrados na aba de testes do change."}}'
+          interval: '30'
+          timeout: '1800'
+          changeCreationTimeOut: '600'
+          abortOnChangeCreationFailure: true
+          abortOnChangeStepTimeout: true
+
+      - uses: actions/checkout@v4
+
+      - name: Deploy to production (simulado)
+        run: |
+          echo "Change: ${{ steps.change.outputs.change-request-number }}"
+          echo "Deploy da versao $APP_VERSION em producao"
+          sleep 20
+          if [ "${{ inputs.simulate_failure }}" = "true" ] || [ -f deploy/FAIL ]; then
+            echo "Falha simulada no deploy"
+            exit 1
+          fi
